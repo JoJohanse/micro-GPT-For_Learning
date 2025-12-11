@@ -17,7 +17,6 @@ training:
 data:
   train_path: data/train.jsonl
   val_path: data/val.jsonl
-  format: instruct
 tokenizer:
   type: hf_tokenizers
   path: tokenizer/tokenizer.json
