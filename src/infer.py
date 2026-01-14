@@ -39,7 +39,8 @@ def generate(model, tok, prompt, max_new_tokens=64, temperature=1.0, top_k=0, to
     with torch.no_grad():
         for step in range(max_new_tokens):
             logits = model(x)
-            logits = logits[:, -1, :] / max(1e-6, temperature)
+            logits = logits[:, -1, :] / max(1e-6, temperature) # 根据temperature缩放生成的token的候选列表，[:,-1,:]是取最后一个位置的输出（下一个token的候选列表）
+            # 屏蔽特殊token
             if hasattr(tok, 'pad_id') and tok.pad_id is not None and tok.pad_id >= 0:
                 logits[0, tok.pad_id] = -float('inf')
             if hasattr(tok, 'bos_id') and tok.bos_id is not None and tok.bos_id >= 0:
@@ -47,36 +48,49 @@ def generate(model, tok, prompt, max_new_tokens=64, temperature=1.0, top_k=0, to
             if hasattr(tok, 'unk_id') and tok.unk_id is not None and tok.unk_id >= 0:
                 logits[0, tok.unk_id] = -float('inf')
             if step == 0 and hasattr(tok, 'eos_id') and tok.eos_id is not None and tok.eos_id >= 0:
-                logits[0, tok.eos_id] = -float('inf')
+                logits[0, tok.eos_id] = -float('inf') # 第一个token不能是eos (结束token)
             if repetition_penalty > 1.0 and len(recent) > 0:
-                for tid in recent[-16:]:
+                for tid in recent[-16:]: # recent是最近生成的16个token列表，对新token的候选列表中recent中出现的token进行缩放，防止重复生成
                     logits[0, tid] = logits[0, tid] / repetition_penalty
             if step < min_tokens and hasattr(tok, 'eos_id') and tok.eos_id is not None and tok.eos_id >= 0:
-                logits[0, tok.eos_id] = -float('inf')
-            probs = torch.softmax(logits, dim=-1)
-            if top_k > 0:
-                v, i = torch.topk(probs, top_k)
-                p = torch.zeros_like(probs).scatter_(1, i, v)
+                logits[0, tok.eos_id] = -float('inf') # 生成的token数小于min_tokens时，不能是eos (结束token)
+            probs = torch.softmax(logits, dim=-1) # 对logits进行softmax，得到下一个token的概率分布
+            if top_k > 0: # 取前k个概率最高的候选token
+                '''
+                原始概率: [0.5, 0.3, 0.1, 0.05, 0.05]
+                top_k = 2
+                保留后: [0.5, 0.3, 0, 0, 0]
+                归一化后: [0.625, 0.375, 0, 0, 0]
+                '''
+                v, i = torch.topk(probs, top_k) 
+                p = torch.zeros_like(probs).scatter_(1, i, v) # 其余设为0
                 s = p.sum(dim=-1, keepdim=True)
-                probs = torch.where(s > 0, p / s, probs)
-            if top_p < 1.0:
-                srt, idx = torch.sort(probs, descending=True)
+                probs = torch.where(s > 0, p / s, probs) # 只保留前K个再进行归一化
+            if top_p < 1.0: # 累计概率
+                '''
+                排序后概率: [0.4, 0.3, 0.2, 0.05, 0.05]
+                累积概率: [0.4, 0.7, 0.9, 0.95, 1.0]
+                top_p = 0.8
+                保留: [0.4, 0.3, 0.2, 0, 0] (累积 0.9 > 0.8，所以保留前 3 个)
+                归一化后: [0.444, 0.333, 0.222, 0, 0]
+                '''
+                srt, idx = torch.sort(probs, descending=True) # 对概率从大到小排序
                 c = torch.cumsum(srt, dim=-1)
-                m = c <= top_p
+                m = c <= top_p # 只取累计概率达到top_p的最小token集合 
                 srt = srt * m
-                p = torch.zeros_like(probs).scatter_(1, idx, srt)
+                p = torch.zeros_like(probs).scatter_(1, idx, srt) # 其余设为0
                 s = p.sum(dim=-1, keepdim=True)
-                probs = torch.where(s > 0, p / s, probs)
-            probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-            if probs.sum() == 0:
+                probs = torch.where(s > 0, p / s, probs) # 重新归一化
+            probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0) # 将 NaN、正无穷、负无穷替换为0
+            if probs.sum() == 0: # 如果候选token的概率和为0，异常情况（可能含有负值），直接取logits中最大logit的token
                 next_id = torch.argmax(logits, dim=-1, keepdim=True)
             else:
                 next_id = torch.multinomial(probs, 1)
-            x = torch.cat([x, next_id], dim=1)
+            x = torch.cat([x, next_id], dim=1) # 拼接新生成的token(目前都是张量)
             recent.append(next_id.item())
             if next_id.item() == tok.eos_id:
                 break
-            if stop_strings:
+            if stop_strings: # 检查输出是否包含停止字符串（如 \n\n 、 ### 等)
                 out_ids = x[0].tolist()[len(prefix):]
                 out_text = tok.decode(out_ids)
                 if any(out_text.endswith(ss) for ss in stop_strings):
