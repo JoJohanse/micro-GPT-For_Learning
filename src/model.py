@@ -15,18 +15,38 @@ class RMSNorm(nn.Module):
         n = n * (n.shape[-1] ** -0.5)
         return (x / (n + self.eps)) * self.weight
 
-def rope(q, k, seq_len, head_dim, device):
+def rope(q, k, seq_len, head_dim, device): # 旋转位置编码（Rotary Positional Encoding, RoPE） 通过旋转矩阵将位置信息注入到 Query 和 Key 中
     half = head_dim // 2
-    idx = torch.arange(half, device=device)
+    idx = torch.arange(half, device=device) # 取中间位置的索引
     pos = torch.arange(seq_len, device=device).unsqueeze(1)
-    rates = torch.pow(10000, -2 * idx / head_dim)
-    theta = pos * rates
+    rates = torch.pow(10000, -2 * idx / head_dim) # 指数衰减
+    theta = pos * rates # 每个位置都对应一个旋转角度
+    '''
+    角度矩阵:
+            维度0   维度1   维度2   维度3
+    位置0:   0.0     0.0     0.0     0.0
+    位置1:   1.0     0.178   0.032   0.006
+    位置2:   2.0     0.356   0.063   0.011
+    位置3:   3.0     0.533   0.095   0.017
+    '''
     cos = torch.cos(theta)
     sin = torch.sin(theta)
     def apply(x):
-        x1 = x[..., :half]
-        x2 = x[..., half:half*2]
-        xr = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+        '''
+        - 这是 2D 旋转公式的实现，即将复数x = x_1 + i x_2 旋转了 θ 角度(e^iθ= cosθ + i sinθ)
+        - 相当于复数乘法：x (x1 + ix2) * e^iθ (cosθ + i sinθ) 
+        '''
+        x1 = x[..., :half] # 前半部分 实部
+        x2 = x[..., half:half*2] # 后半部分 虚部
+        '''
+        旋转后的张量形状:
+        x 的形状：[B, h, T, head_dim] (B: 批量大小, h: 头数, T: 序列长度, head_dim: 每个头的维度)
+                        ↓
+        广播后：  [B, h, T, half]  (cos 和 sin 的形状是 [T, half])
+        '''
+        x1_rot = x1 * cos - x2 * sin # 旋转后的实部
+        x2_rot = x1 * sin + x2 * cos # 旋转后的虚部
+        xr = torch.cat([x1_rot, x2_rot], dim=-1) # 旋转后的实部和虚部拼接 (B, h, T, head_dim)
         return xr
     return apply(q), apply(k)
 
